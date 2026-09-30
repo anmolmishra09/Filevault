@@ -2,12 +2,14 @@
  * FileVault — Modern Public File Upload and Sharing Web Application
  * Core Modules:
  * 1. CONFIG & ALLOWED FORMATS
- * 2. REST API CLIENT LAYER
- * 3. UI TOAST & NOTIFICATION SYSTEM
- * 4. THEME MANAGER
- * 5. UPLOAD & DRAG/DROP MANAGER
- * 6. PUBLIC REPOSITORY & SEARCH/FILTER MANAGER
- * 7. MODAL PREVIEW & SHARING ENGINE
+ * 2. INDEXEDDB PERSISTENT STORAGE ENGINE (Cross-tab & refresh persistent)
+ * 3. CROSS-TAB BROADCAST CHANNEL (Instant sync across open tabs)
+ * 4. REST API & PERSISTENCE LAYER
+ * 5. UI TOAST & NOTIFICATION SYSTEM
+ * 6. THEME MANAGER
+ * 7. UPLOAD & DRAG/DROP MANAGER
+ * 8. PUBLIC REPOSITORY & SEARCH/FILTER MANAGER
+ * 9. MODAL PREVIEW & SHARING ENGINE
  */
 
 const CONFIG = {
@@ -15,6 +17,9 @@ const CONFIG = {
   MAX_FILE_SIZE_BYTES: 100 * 1024 * 1024, // 100 MB
   DEMO_MODE: true,
   SEARCH_DEBOUNCE_MS: 220,
+  DB_NAME: "FileVault_DB",
+  DB_VERSION: 1,
+  STORE_NAME: "public_files",
 };
 
 // Configurable Allowed Formats & Category Mapping
@@ -71,13 +76,234 @@ const FILE_CATEGORIES = {
 };
 
 /**
- * Dedicated REST API service layer
+ * ============================================================
+ * INDEXEDDB PERSISTENCE ENGINE
+ * Stores actual binary Blob objects & metadata persistently.
+ * Survives page refreshes, tab closures, and browser restarts.
+ * ============================================================
+ */
+class IndexedDBStorage {
+  constructor() {
+    this.db = null;
+    this.initPromise = this.init();
+  }
+
+  init() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(CONFIG.DB_NAME, CONFIG.DB_VERSION);
+
+      request.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains(CONFIG.STORE_NAME)) {
+          const store = db.createObjectStore(CONFIG.STORE_NAME, { keyPath: "id" });
+          store.createIndex("uploadedAt", "uploadedAt", { unique: false });
+        }
+      };
+
+      request.onsuccess = (e) => {
+        this.db = e.target.result;
+        resolve(this.db);
+      };
+
+      request.onerror = (e) => {
+        console.error("IndexedDB error:", e.target.error);
+        reject(e.target.error);
+      };
+    });
+  }
+
+  async getAllFiles() {
+    await this.initPromise;
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(CONFIG.STORE_NAME, "readonly");
+      const store = tx.objectStore(CONFIG.STORE_NAME);
+      const request = store.getAll();
+
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = (e) => reject(e.target.error);
+    });
+  }
+
+  async getFile(id) {
+    await this.initPromise;
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(CONFIG.STORE_NAME, "readonly");
+      const store = tx.objectStore(CONFIG.STORE_NAME);
+      const request = store.get(id);
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = (e) => reject(e.target.error);
+    });
+  }
+
+  async saveFile(fileRecord) {
+    await this.initPromise;
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(CONFIG.STORE_NAME, "readwrite");
+      const store = tx.objectStore(CONFIG.STORE_NAME);
+      const request = store.put(fileRecord);
+
+      request.onsuccess = () => resolve(fileRecord);
+      request.onerror = (e) => reject(e.target.error);
+    });
+  }
+
+  async deleteFile(id) {
+    await this.initPromise;
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(CONFIG.STORE_NAME, "readwrite");
+      const store = tx.objectStore(CONFIG.STORE_NAME);
+      const request = store.delete(id);
+
+      request.onsuccess = () => resolve(true);
+      request.onerror = (e) => reject(e.target.error);
+    });
+  }
+}
+
+const idbStorage = new IndexedDBStorage();
+
+/**
+ * ============================================================
+ * CROSS-TAB REAL-TIME SYNCHRONIZER
+ * Uses BroadcastChannel (or localStorage event fallback)
+ * to immediately reflect uploads across all open tabs.
+ * ============================================================
+ */
+let tabSyncChannel = null;
+if (typeof BroadcastChannel !== 'undefined') {
+  tabSyncChannel = new BroadcastChannel('filevault_sync_channel');
+  tabSyncChannel.onmessage = (event) => {
+    if (event.data && (event.data.type === 'FILE_UPLOADED' || event.data.type === 'FILE_DELETED')) {
+      loadFiles(false); // Reload silently without resetting UI state
+      loadStats();
+    }
+  };
+}
+
+function broadcastSync(type, payload = {}) {
+  if (tabSyncChannel) {
+    tabSyncChannel.postMessage({ type, payload });
+  } else {
+    // Fallback using storage event
+    localStorage.setItem('filevault_sync_ping', JSON.stringify({ type, time: Date.now() }));
+  }
+}
+
+// Storage event fallback for older browsers
+window.addEventListener('storage', (e) => {
+  if (e.key === 'filevault_sync_ping') {
+    loadFiles(false);
+    loadStats();
+  }
+});
+
+/**
+ * Initial sample files seeded once into IndexedDB
+ */
+function getInitialSeedData() {
+  return [
+    {
+      id: "f-101",
+      name: "Cloud_Infrastructure_2026.pdf",
+      extension: "pdf",
+      type: "application/pdf",
+      category: "pdf",
+      size: 4718592,
+      uploadedAt: new Date(Date.now() - 3600000 * 4).toISOString(),
+      downloadCount: 342,
+      uploader: "DevOps Team",
+      url: "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+      contentSnippet: "FileVault Cloud System Overview\n\nHigh Availability distributed public repository designed for multi-region replication."
+    },
+    {
+      id: "f-102",
+      name: "Architecture_Topology_Blueprint.webp",
+      extension: "webp",
+      type: "image/webp",
+      category: "image",
+      size: 2097152,
+      uploadedAt: new Date(Date.now() - 3600000 * 18).toISOString(),
+      downloadCount: 889,
+      uploader: "Systems Architect",
+      url: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1200&q=80",
+      thumbnailUrl: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=400&q=70"
+    },
+    {
+      id: "f-103",
+      name: "Global_Latency_Report_Q3.csv",
+      extension: "csv",
+      type: "text/csv",
+      category: "sheet",
+      size: 524288,
+      uploadedAt: new Date(Date.now() - 3600000 * 30).toISOString(),
+      downloadCount: 156,
+      uploader: "Performance Analyst",
+      url: "#",
+      contentSnippet: "Region,AvgLatencyMs,P99LatencyMs,ThroughputMbps\nus-east-1,12.4,34.1,840\neu-central-1,18.2,42.8,790\nap-southeast-1,24.6,58.3,620\nsa-east-1,45.1,98.2,410"
+    },
+    {
+      id: "f-104",
+      name: "Public_API_Specification.json",
+      extension: "json",
+      type: "application/json",
+      category: "text",
+      size: 131072,
+      uploadedAt: new Date(Date.now() - 3600000 * 50).toISOString(),
+      downloadCount: 673,
+      uploader: "API Core Team",
+      url: "#",
+      contentSnippet: '{\n  "name": "FileVault REST Specification",\n  "version": "2.4.0",\n  "protocol": "HTTPS",\n  "endpoints": ["/api/files", "/api/files/upload", "/api/stats"],\n  "publicAccess": true\n}'
+    },
+    {
+      id: "f-105",
+      name: "Data_Pipeline_Bundle_v4.zip",
+      extension: "zip",
+      type: "application/zip",
+      category: "archive",
+      size: 24117248,
+      uploadedAt: new Date(Date.now() - 3600000 * 72).toISOString(),
+      downloadCount: 94,
+      uploader: "Data Engineering",
+      url: "#"
+    },
+    {
+      id: "f-106",
+      name: "Team_Offsite_Keynote_Deck.pptx",
+      extension: "pptx",
+      type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      category: "pres",
+      size: 14680064,
+      uploadedAt: new Date(Date.now() - 3600000 * 96).toISOString(),
+      downloadCount: 88,
+      uploader: "Product Ops",
+      url: "#"
+    }
+  ];
+}
+
+/**
+ * REST API & Local Persistent Engine Adapter
  */
 class ApiService {
   constructor(baseUrl, isDemo = false) {
     this.baseUrl = baseUrl;
     this.isDemo = isDemo;
-    this.mockStorage = this.initSeedData();
+    this.initDatabase();
+  }
+
+  async initDatabase() {
+    try {
+      const existing = await idbStorage.getAllFiles();
+      if (!existing || existing.length === 0) {
+        const seedData = getInitialSeedData();
+        for (const item of seedData) {
+          await idbStorage.saveFile(item);
+        }
+      }
+    } catch (e) {
+      console.warn("DB seed check warning:", e);
+    }
   }
 
   setDemoMode(val) {
@@ -86,87 +312,6 @@ class ApiService {
 
   setBaseUrl(url) {
     this.baseUrl = url;
-  }
-
-  initSeedData() {
-    return [
-      {
-        id: "f-101",
-        name: "Cloud_Infrastructure_2026.pdf",
-        extension: "pdf",
-        type: "application/pdf",
-        category: "pdf",
-        size: 4718592,
-        uploadedAt: new Date(Date.now() - 3600000 * 4).toISOString(),
-        downloadCount: 342,
-        uploader: "DevOps Team",
-        url: "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
-        contentSnippet: "FileVault Cloud System Overview\n\nHigh Availability distributed public repository designed for multi-region replication."
-      },
-      {
-        id: "f-102",
-        name: "Architecture_Topology_Blueprint.webp",
-        extension: "webp",
-        type: "image/webp",
-        category: "image",
-        size: 2097152,
-        uploadedAt: new Date(Date.now() - 3600000 * 18).toISOString(),
-        downloadCount: 889,
-        uploader: "Systems Architect",
-        url: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=1200&q=80",
-        thumbnailUrl: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?auto=format&fit=crop&w=400&q=70"
-      },
-      {
-        id: "f-103",
-        name: "Global_Latency_Report_Q3.csv",
-        extension: "csv",
-        type: "text/csv",
-        category: "sheet",
-        size: 524288,
-        uploadedAt: new Date(Date.now() - 3600000 * 30).toISOString(),
-        downloadCount: 156,
-        uploader: "Performance Analyst",
-        url: "#",
-        contentSnippet: "Region,AvgLatencyMs,P99LatencyMs,ThroughputMbps\nus-east-1,12.4,34.1,840\neu-central-1,18.2,42.8,790\nap-southeast-1,24.6,58.3,620\nsa-east-1,45.1,98.2,410"
-      },
-      {
-        id: "f-104",
-        name: "Public_API_Specification.json",
-        extension: "json",
-        type: "application/json",
-        category: "text",
-        size: 131072,
-        uploadedAt: new Date(Date.now() - 3600000 * 50).toISOString(),
-        downloadCount: 673,
-        uploader: "API Core Team",
-        url: "#",
-        contentSnippet: '{\n  "name": "FileVault REST Specification",\n  "version": "2.4.0",\n  "protocol": "HTTPS",\n  "endpoints": ["/api/files", "/api/files/upload", "/api/stats"],\n  "publicAccess": true\n}'
-      },
-      {
-        id: "f-105",
-        name: "Data_Pipeline_Bundle_v4.zip",
-        extension: "zip",
-        type: "application/zip",
-        category: "archive",
-        size: 24117248,
-        uploadedAt: new Date(Date.now() - 3600000 * 72).toISOString(),
-        downloadCount: 94,
-        uploader: "Data Engineering",
-        url: "#"
-      },
-      {
-        id: "f-106",
-        name: "Team_Offsite_Keynote_Deck.pptx",
-        extension: "pptx",
-        type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        category: "pres",
-        size: 14680064,
-        uploadedAt: new Date(Date.now() - 3600000 * 96).toISOString(),
-        downloadCount: 88,
-        uploader: "Product Ops",
-        url: "#"
-      }
-    ];
   }
 
   async getFiles() {
@@ -179,12 +324,14 @@ class ApiService {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return await res.json();
       } catch (err) {
-        console.warn("Live API GET /files unreachable. Gracefully switching to demo sandbox:", err.message);
+        console.warn("Live API GET /files unreachable. Falling back to persistent database:", err.message);
         updateApiIndicator(false);
       }
     }
-    await new Promise(r => setTimeout(r, 450));
-    return [...this.mockStorage];
+
+    // Return all files stored persistently in IndexedDB
+    const files = await idbStorage.getAllFiles();
+    return files;
   }
 
   async getFile(id) {
@@ -193,12 +340,13 @@ class ApiService {
         const res = await fetch(`${this.baseUrl}/files/${id}`);
         if (res.ok) return await res.json();
       } catch (e) {
-        console.warn("Live API getFile failed, using demo store");
+        console.warn("Live API getFile failed, checking local database");
       }
     }
-    const file = this.mockStorage.find(f => f.id === id);
-    if (!file) throw new Error("File not found");
-    return { ...file };
+
+    const file = await idbStorage.getFile(id);
+    if (!file) throw new Error("File not found in storage");
+    return file;
   }
 
   async uploadFile(fileObj, onProgress) {
@@ -234,45 +382,61 @@ class ApiService {
           xhr.send(formData);
         });
       } catch (err) {
-        console.warn("Live upload endpoint failed, falling back to simulated stream:", err.message);
+        console.warn("Live upload endpoint failed, storing into browser IndexedDB:", err.message);
       }
     }
 
-    return new Promise((resolve) => {
+    // Persistent storage simulation with realistic progress animation
+    return new Promise((resolve, reject) => {
       let progress = 0;
-      const interval = setInterval(() => {
-        progress += Math.floor(Math.random() * 22) + 12;
+      const interval = setInterval(async () => {
+        progress += Math.floor(Math.random() * 24) + 14;
         if (progress >= 100) {
           progress = 100;
           clearInterval(interval);
           if (onProgress) onProgress(100);
 
-          const ext = getExtension(fileObj.name);
-          const category = getCategoryFromExtension(ext);
-          const isImage = category === 'image';
-          const localUrl = URL.createObjectURL(fileObj);
+          try {
+            const ext = getExtension(fileObj.name);
+            const category = getCategoryFromExtension(ext);
 
-          const newFileRecord = {
-            id: "f-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
-            name: fileObj.name,
-            extension: ext,
-            type: fileObj.type || 'application/octet-stream',
-            category: category,
-            size: fileObj.size,
-            uploadedAt: new Date().toISOString(),
-            downloadCount: 0,
-            uploader: "Visitor (" + (navigator.platform || 'Public User').split(' ')[0] + ")",
-            url: localUrl,
-            thumbnailUrl: isImage ? localUrl : null,
-            isLocalBlob: true
-          };
+            // Optional text snippet reading for instant code/document previews
+            let snippet = null;
+            if (category === 'text' || ext === 'csv' || ext === 'json' || ext === 'md') {
+              try {
+                snippet = await fileObj.text();
+                if (snippet.length > 5000) snippet = snippet.slice(0, 5000) + "\n...[truncated]";
+              } catch (e) {}
+            }
 
-          this.mockStorage.unshift(newFileRecord);
-          resolve(newFileRecord);
+            const newFileRecord = {
+              id: "f-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
+              name: fileObj.name,
+              extension: ext,
+              type: fileObj.type || 'application/octet-stream',
+              category: category,
+              size: fileObj.size,
+              uploadedAt: new Date().toISOString(),
+              downloadCount: 0,
+              uploader: "Visitor (" + (navigator.platform || 'Public User').split(' ')[0] + ")",
+              contentSnippet: snippet,
+              fileBlob: fileObj // IndexedDB natively persists real File / Blob binary data!
+            };
+
+            // Save to IndexedDB
+            await idbStorage.saveFile(newFileRecord);
+
+            // Notify other open tabs immediately!
+            broadcastSync('FILE_UPLOADED', { id: newFileRecord.id });
+
+            resolve(newFileRecord);
+          } catch (err) {
+            reject(err);
+          }
         } else {
           if (onProgress) onProgress(progress);
         }
-      }, 140);
+      }, 120);
     });
   }
 
@@ -282,18 +446,15 @@ class ApiService {
         const res = await fetch(`${this.baseUrl}/files/${id}`, { method: 'DELETE' });
         if (res.ok) return true;
       } catch (e) {
-        console.warn("Live delete failed, using demo fallback");
+        console.warn("Live delete failed, using local database fallback");
       }
     }
-    const index = this.mockStorage.findIndex(f => f.id === id);
-    if (index !== -1) {
-      const removed = this.mockStorage.splice(index, 1)[0];
-      if (removed.isLocalBlob && removed.url && removed.url.startsWith("blob:")) {
-        URL.revokeObjectURL(removed.url);
-      }
-      return true;
+
+    const success = await idbStorage.deleteFile(id);
+    if (success) {
+      broadcastSync('FILE_DELETED', { id });
     }
-    return false;
+    return success;
   }
 
   async getStats() {
@@ -303,9 +464,11 @@ class ApiService {
         if (res.ok) return await res.json();
       } catch (e) {}
     }
-    const totalFiles = this.mockStorage.length;
-    const totalBytes = this.mockStorage.reduce((acc, f) => acc + (f.size || 0), 0);
-    const totalDownloads = this.mockStorage.reduce((acc, f) => acc + (f.downloadCount || 0), 0);
+
+    const all = await idbStorage.getAllFiles();
+    const totalFiles = all.length;
+    const totalBytes = all.reduce((acc, f) => acc + (f.size || 0), 0);
+    const totalDownloads = all.reduce((acc, f) => acc + (f.downloadCount || 0), 0);
 
     return { totalFiles, totalBytes, totalDownloads };
   }
@@ -435,7 +598,7 @@ themeToggleBtn.addEventListener('click', () => {
 
 initTheme();
 
-// Mode Toggle (Live API vs Demo Sandbox)
+// Mode indicator
 const modeToggleBtn = document.getElementById('mode-toggle-btn');
 const apiStatusDot = document.getElementById('api-status-dot');
 const apiStatusText = document.getElementById('api-status-text');
@@ -446,8 +609,8 @@ function updateApiIndicator(isLive) {
     apiStatusText.textContent = 'REST API Connected';
     FileVaultAPI.setDemoMode(false);
   } else {
-    apiStatusDot.className = 'w-2 h-2 rounded-full bg-amber-500';
-    apiStatusText.textContent = 'Demo Mode (Local)';
+    apiStatusDot.className = 'w-2 h-2 rounded-full bg-emerald-500';
+    apiStatusText.textContent = 'Persistent Storage Active';
     FileVaultAPI.setDemoMode(true);
   }
 }
@@ -455,7 +618,7 @@ function updateApiIndicator(isLive) {
 modeToggleBtn.addEventListener('click', () => {
   const newMode = !FileVaultAPI.isDemo;
   updateApiIndicator(!newMode);
-  showToast(newMode ? "Demo Mode Active: Storage isolated locally" : "Live API Mode Active: Targeting " + FileVaultAPI.baseUrl, "warning");
+  showToast(newMode ? "Persistent Browser Storage Active: Synced across all tabs" : "Live API Mode: Targeting " + FileVaultAPI.baseUrl, "info");
   loadFiles();
   loadStats();
 });
@@ -640,8 +803,8 @@ async function initiateUpload(queueItem) {
     queueItem.isFinished = true;
     renderQueueUI();
 
-    showToast(`✓ "${queueItem.name}" published to repository`, 'success');
-    loadFiles();
+    showToast(`✓ "${queueItem.name}" stored permanently`, 'success');
+    loadFiles(false);
     loadStats();
   } catch (err) {
     queueItem.status = 'error';
@@ -691,12 +854,14 @@ let activeFilterCategory = 'all';
 let activeSearchQuery = '';
 let activeSortKey = 'newest';
 
-async function loadFiles() {
-  filesSkeleton.classList.remove('hidden');
-  filesGrid.classList.add('hidden');
-  emptyState.classList.add('hidden');
-  errorState.classList.add('hidden');
-  refreshIcon.classList.add('animate-spin');
+async function loadFiles(showLoadingSkeleton = true) {
+  if (showLoadingSkeleton) {
+    filesSkeleton.classList.remove('hidden');
+    filesGrid.classList.add('hidden');
+    emptyState.classList.add('hidden');
+    errorState.classList.add('hidden');
+    refreshIcon.classList.add('animate-spin');
+  }
 
   try {
     const files = await FileVaultAPI.getFiles();
@@ -705,7 +870,7 @@ async function loadFiles() {
   } catch (err) {
     filesSkeleton.classList.add('hidden');
     errorState.classList.remove('hidden');
-    document.getElementById('error-state-message').textContent = err.message || "Failed to communicate with repository.";
+    document.getElementById('error-state-message').textContent = err.message || "Failed to communicate with storage.";
   } finally {
     refreshIcon.classList.remove('animate-spin');
   }
@@ -765,15 +930,26 @@ function renderFileCards(items) {
   filesGrid.innerHTML = items.map(file => {
     const catKey = file.category || getCategoryFromExtension(file.extension);
     const catMeta = FILE_CATEGORIES[catKey] || FILE_CATEGORIES.doc;
-    const isImage = catKey === 'image' && (file.thumbnailUrl || file.url);
+    
+    // Check if image thumbnail is available
+    let imageSrc = null;
+    if (catKey === 'image') {
+      if (file.thumbnailUrl) {
+        imageSrc = file.thumbnailUrl;
+      } else if (file.fileBlob) {
+        imageSrc = URL.createObjectURL(file.fileBlob);
+      } else if (file.url && file.url !== '#') {
+        imageSrc = file.url;
+      }
+    }
 
     return `
       <div class="group relative rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 hover:border-brand-500/50 dark:hover:border-brand-500/50 shadow-sm hover:shadow-xl transition-all duration-200 flex flex-col justify-between overflow-hidden">
         
         <div class="relative bg-slate-100 dark:bg-slate-950/80 h-38 sm:h-42 flex items-center justify-center border-b border-slate-100 dark:border-slate-800/80 overflow-hidden cursor-pointer" onclick="openPreviewModal('${file.id}')">
-          ${isImage ? `
+          ${imageSrc ? `
             <img 
-              src="${file.thumbnailUrl || file.url}" 
+              src="${imageSrc}" 
               alt="${file.name}" 
               loading="lazy" 
               class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
@@ -873,7 +1049,7 @@ categoryPills.forEach(pill => {
 });
 
 refreshFilesBtn.addEventListener('click', () => {
-  showToast("Syncing public repository with backend...", "info", 1800);
+  showToast("Syncing public repository...", "info", 1800);
   loadFiles();
   loadStats();
 });
@@ -927,15 +1103,22 @@ window.openPreviewModal = async function(fileId) {
 function renderModalCanvasContent(file, category) {
   modalContentCanvas.innerHTML = '';
 
-  if (category === 'image' && file.url) {
+  let activeUrl = null;
+  if (file.fileBlob) {
+    activeUrl = URL.createObjectURL(file.fileBlob);
+  } else if (file.url && file.url !== '#') {
+    activeUrl = file.url;
+  }
+
+  if (category === 'image' && activeUrl) {
     const img = document.createElement('img');
-    img.src = file.url;
+    img.src = activeUrl;
     img.alt = file.name;
     img.className = 'max-h-[68vh] max-w-full rounded-xl object-contain shadow-md';
     modalContentCanvas.appendChild(img);
-  } else if (category === 'pdf' && file.url && file.url !== '#') {
+  } else if (category === 'pdf' && activeUrl) {
     const iframe = document.createElement('iframe');
-    iframe.src = file.url;
+    iframe.src = activeUrl;
     iframe.title = file.name;
     iframe.className = 'w-full h-[65vh] rounded-xl border border-slate-200 dark:border-slate-800 bg-white';
     modalContentCanvas.appendChild(iframe);
@@ -953,7 +1136,7 @@ function renderModalCanvasContent(file, category) {
       </div>
       <h4 class="text-base font-bold text-slate-900 dark:text-white">In-Browser Preview Unavailable</h4>
       <p class="text-xs text-slate-500 dark:text-slate-400 mt-1 mb-5">
-        This proprietary file format (${file.extension.toUpperCase()}) cannot be rendered directly in the web browser sandbox. Download to view natively.
+        This file format (${file.extension.toUpperCase()}) cannot be rendered natively inside the web browser sandbox. Download to view directly on your device.
       </p>
       <button onclick="downloadFile('${file.id}')" class="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold shadow-md transition">
         Download File to Device
@@ -980,14 +1163,25 @@ document.addEventListener('keydown', (e) => {
 });
 
 // Download and Share Links
-window.downloadFile = function(fileId) {
+window.downloadFile = async function(fileId) {
   const file = rawFilesList.find(f => f.id === fileId);
   if (!file) return;
 
   file.downloadCount = (file.downloadCount || 0) + 1;
+  await idbStorage.saveFile(file);
   
   const link = document.createElement('a');
-  link.href = file.url && file.url !== '#' ? file.url : 'data:text/plain;charset=utf-8,' + encodeURIComponent(file.contentSnippet || "FileVault Public Document: " + file.name);
+  let downloadUrl = '#';
+
+  if (file.fileBlob) {
+    downloadUrl = URL.createObjectURL(file.fileBlob);
+  } else if (file.url && file.url !== '#') {
+    downloadUrl = file.url;
+  } else {
+    downloadUrl = 'data:text/plain;charset=utf-8,' + encodeURIComponent(file.contentSnippet || "FileVault Document: " + file.name);
+  }
+
+  link.href = downloadUrl;
   link.download = file.name;
   document.body.appendChild(link);
   link.click();
@@ -1036,7 +1230,7 @@ window.confirmDeleteFile = async function(fileId, encodedName) {
     const success = await FileVaultAPI.deleteFile(fileId);
     if (success) {
       showToast(`File "${fileName}" deleted from repository`, "info");
-      loadFiles();
+      loadFiles(false);
       loadStats();
     } else {
       showToast("Failed to delete file", "error");
